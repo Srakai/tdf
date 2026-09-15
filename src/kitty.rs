@@ -15,7 +15,8 @@ use kittage::{
 	display::{CursorMovementPolicy, DisplayConfig, DisplayLocation},
 	error::TransmitError,
 	image::Image,
-	medium::Medium
+	medium::Medium,
+	tmux::TmuxWriter
 };
 use ratatui::layout::Position;
 use smallvec::SmallVec;
@@ -66,8 +67,15 @@ pub async fn run_action<'es>(
 	action: Action<'_, '_>,
 	ev_stream: &'es mut EventStream
 ) -> Result<Option<ImageId>, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
+	let stdout = std::io::stdout();
+	let stdout = stdout.lock();
+	let writer: Box<dyn Write + '_> = if std::env::var_os("TMUX").is_some() {
+		Box::new(TmuxWriter::new(stdout))
+	} else {
+		Box::new(stdout)
+	};
 	let writer = DbgWriter {
-		w: std::io::stdout().lock(),
+		w: writer,
 		#[cfg(debug_assertions)]
 		buf: String::new()
 	};
