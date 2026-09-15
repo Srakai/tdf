@@ -1,7 +1,4 @@
-use core::{
-	error::Error,
-	num::{NonZeroU32, NonZeroUsize}
-};
+use core::{error::Error, num::NonZeroUsize};
 use std::{
 	borrow::Cow,
 	ffi::OsString,
@@ -39,7 +36,8 @@ use tdf::{
 	PrerenderLimit,
 	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
 	kitty::{
-		DisplayErr, DisplayErrSource, KittyDisplay, display_kitty_images, do_shms_work, run_action
+		DisplayErr, DisplayErrSource, KittyDisplay, MaybeTmuxWriter, display_kitty_images,
+		do_shms_work, run_action
 	},
 	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
 	tui::{BottomMessage, InputAction, MessageSetting, Tui}
@@ -312,8 +310,9 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let (to_main, from_converter) = flume::unbounded();
 
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
+	let is_tmux = std::env::var_os("TMUX").is_some();
 
-	let shms_work = is_kitty && do_shms_work(&mut ev_stream).await;
+	let shms_work = is_kitty && do_shms_work(is_tmux, &mut ev_stream).await;
 
 	tokio::spawn(run_conversion_loop(
 		to_main, from_main, picker, 20, shms_work
@@ -338,11 +337,13 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	})?;
 
 	if is_kitty {
+		let mut writer = MaybeTmuxWriter::new(stdout().lock(), is_tmux);
 		run_action(
 			Action::Delete(DeleteConfig {
 				effect: ClearOrDelete::Delete,
-				which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
+				which: WhichToDelete::All
 			}),
+			&mut writer,
 			&mut ev_stream
 		)
 		.await
@@ -364,13 +365,14 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let tui_rx = tui_rx.into_stream();
 	let from_converter = from_converter.into_stream();
 
-	enter_redraw_loop(
-		ev_stream,
+	let res = enter_redraw_loop(
+		&mut ev_stream,
 		to_renderer,
 		tui_rx,
 		to_converter,
 		from_converter,
 		fullscreen,
+		is_tmux,
 		tui,
 		&mut term,
 		main_area,
@@ -384,21 +386,35 @@ async fn inner_main() -> Result<(), WrappedErr> {
 			)
 			.into()
 		)
-	})?;
+	});
 
+	if is_kitty {
+		let mut writer = MaybeTmuxWriter::new(stdout().lock(), is_tmux);
+		_ = run_action(
+			Action::Delete(DeleteConfig {
+				effect: ClearOrDelete::Delete,
+				which: WhichToDelete::All
+			}),
+			&mut writer,
+			&mut ev_stream
+		)
+		.await;
+	}
 	drop(maybe_logger);
-	Ok(())
+
+	res
 }
 
 // oh shut up clippy who cares
 #[expect(clippy::too_many_arguments)]
 async fn enter_redraw_loop(
-	mut ev_stream: EventStream,
+	ev_stream: &mut EventStream,
 	to_renderer: Sender<RenderNotif>,
 	mut tui_rx: RecvStream<'_, Result<RenderInfo, RenderError>>,
 	to_converter: Sender<ConverterMsg>,
 	mut from_converter: RecvStream<'_, Result<ConvertedPage, RenderError>>,
 	mut fullscreen: bool,
+	is_tmux: bool,
 	mut tui: Tui,
 	term: &mut Terminal<CrosstermBackend<Stdout>>,
 	mut main_area: tdf::tui::RenderLayout,
@@ -479,7 +495,7 @@ async fn enter_redraw_loop(
 			})?;
 
 			let maybe_err =
-				display_kitty_images(to_display, &mut ev_stream, &mut kitty_z_idx).await;
+				display_kitty_images(to_display, is_tmux, ev_stream, &mut kitty_z_idx).await;
 
 			if let Err(DisplayErr {
 				failed_pages,
