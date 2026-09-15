@@ -71,7 +71,8 @@ pub async fn run_conversion_loop(
 	receiver: Receiver<ConverterMsg>,
 	picker: Picker,
 	prerender: usize,
-	shms_work: bool
+	shms_work: bool,
+	use_kittage: bool
 ) -> Result<(), Box<SendError<Result<ConvertedPage, RenderError>>>> {
 	let mut images = vec![];
 	let mut page: usize = 0;
@@ -84,7 +85,8 @@ pub async fn run_conversion_loop(
 		iteration: &mut usize,
 		prerender: usize,
 		pid: u32,
-		shms_work: bool
+		shms_work: bool,
+		use_kittage: bool
 	) -> Result<Option<ConvertedPage>, RenderError> {
 		if images.is_empty() || *iteration >= prerender {
 			return Ok(None);
@@ -142,7 +144,7 @@ pub async fn run_conversion_loop(
 		let dyn_img = DynamicImage::ImageRgb8(dyn_img);
 
 		let txt_img = match picker.protocol_type() {
-			ProtocolType::Kitty => {
+			ProtocolType::Kitty if use_kittage => {
 				let rn = SystemTime::now()
 					.duration_since(UNIX_EPOCH)
 					.unwrap_or_default()
@@ -231,7 +233,8 @@ pub async fn run_conversion_loop(
 				&mut iteration,
 				prerender,
 				pid,
-				shms_work
+				shms_work,
+				use_kittage
 			) {
 				Ok(None) => break,
 				Ok(Some(img)) => sender.send(Ok(img))?,

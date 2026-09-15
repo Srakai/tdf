@@ -39,7 +39,7 @@ pub struct Tui {
 	rendered: Vec<RenderedInfo>,
 	page_constraints: PageConstraints,
 	showing_help_msg: bool,
-	is_kitty: bool,
+	use_kittage: bool,
 	zoom: Option<Zoom>
 }
 
@@ -185,7 +185,12 @@ pub struct RenderLayout {
 
 impl Tui {
 	#[must_use]
-	pub fn new(name: String, max_wide: Option<NonZeroUsize>, r_to_l: bool, is_kitty: bool) -> Self {
+	pub fn new(
+		name: String,
+		max_wide: Option<NonZeroUsize>,
+		r_to_l: bool,
+		use_kittage: bool
+	) -> Self {
 		Self {
 			name,
 			page: 0,
@@ -195,7 +200,7 @@ impl Tui {
 			rendered: vec![],
 			page_constraints: PageConstraints { max_wide, r_to_l },
 			showing_help_msg: false,
-			is_kitty,
+			use_kittage,
 			zoom: None
 		}
 	}
@@ -726,7 +731,7 @@ impl Tui {
 			InputAction::JumpingToPage(new_page)
 		}
 
-		let can_zoom = self.is_kitty && self.zoom.is_some();
+		let can_zoom = self.use_kittage && self.zoom.is_some();
 
 		match ev {
 			Event::Key(key) => {
@@ -740,7 +745,7 @@ impl Tui {
 					}
 					KeyCode::Char(c)
 						if let BottomMessage::Input(InputCommand::GoToPage(_)) =
-							self.bottom_msg && matches!(c, 'g' if self.is_kitty) =>
+							self.bottom_msg && matches!(c, 'g' if self.use_kittage) =>
 					{
 						self.set_msg(MessageSetting::Pop);
 						self.update_zoom(Zoom::pan_bottom)
@@ -839,7 +844,7 @@ impl Tui {
 							self.last_render.rect = Rect::default();
 							Some(InputAction::Redraw)
 						}
-						'z' if self.is_kitty => {
+						'z' if self.use_kittage => {
 							let (zoom, f_or_f) = match self.zoom {
 								None => (Some(Zoom::default()), FitOrFill::Fill),
 								Some(_) => (None, FitOrFill::Fit)
@@ -1042,10 +1047,10 @@ impl Tui {
 			Text::from(HELP_PAGE),
 			// just some spacing
 			Text::from(""),
-			if self.is_kitty {
+			if self.use_kittage {
 				Text::from(KITTY_HELP)
 			} else {
-				Text::from("Not using kitty, kitty-specific keybindings hidden")
+				Text::from("Kitty-specific zoom is unavailable with this rendering mode")
 					.style(Color::DarkGray)
 			}
 		];

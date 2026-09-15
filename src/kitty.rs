@@ -1,8 +1,5 @@
 use core::fmt::Display;
-use std::{
-	io::{StdoutLock, Write, stdout},
-	num::NonZeroU32
-};
+use std::{io::Write, num::NonZeroU32};
 
 use crossterm::{
 	cursor::MoveTo,
@@ -18,8 +15,7 @@ use kittage::{
 	display::{CursorMovementPolicy, DisplayConfig, DisplayLocation},
 	error::TransmitError,
 	image::Image,
-	medium::Medium,
-	tmux::TmuxWriter
+	medium::Medium
 };
 use ratatui::layout::Position;
 use smallvec::SmallVec;
@@ -66,47 +62,12 @@ impl<W: Write> Write for DbgWriter<W> {
 	}
 }
 
-pub enum MaybeTmuxWriter<W>
-where
-	W: Write
-{
-	Tmux(TmuxWriter<W>),
-	Normal(W)
-}
-
-impl<W: Write> MaybeTmuxWriter<W> {
-	pub fn new(w: W, is_tmux: bool) -> Self {
-		if is_tmux {
-			Self::Tmux(TmuxWriter::new(w))
-		} else {
-			Self::Normal(w)
-		}
-	}
-}
-
-impl<W: Write> Write for &mut MaybeTmuxWriter<W> {
-	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-		match *self {
-			MaybeTmuxWriter::Tmux(t) => t.write(buf),
-			MaybeTmuxWriter::Normal(w) => w.write(buf)
-		}
-	}
-
-	fn flush(&mut self) -> std::io::Result<()> {
-		match *self {
-			MaybeTmuxWriter::Tmux(t) => t.flush(),
-			MaybeTmuxWriter::Normal(w) => w.flush()
-		}
-	}
-}
-
 pub async fn run_action<'es>(
 	action: Action<'_, '_>,
-	writer: &mut MaybeTmuxWriter<StdoutLock<'_>>,
 	ev_stream: &'es mut EventStream
 ) -> Result<Option<ImageId>, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
 	let writer = DbgWriter {
-		w: writer,
+		w: std::io::stdout().lock(),
 		#[cfg(debug_assertions)]
 		buf: String::new()
 	};
@@ -116,7 +77,7 @@ pub async fn run_action<'es>(
 		.map(|(_, i)| i)
 }
 
-pub async fn do_shms_work(is_tmux: bool, ev_stream: &mut EventStream) -> bool {
+pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
 	let img = DynamicImage::new_rgb8(1, 1);
 	let pid = std::process::id();
 	let shm_name = format!("tdf_test_{pid}");
@@ -133,8 +94,7 @@ pub async fn do_shms_work(is_tmux: bool, ev_stream: &mut EventStream) -> bool {
 
 	enable_raw_mode().unwrap();
 
-	let mut writer = MaybeTmuxWriter::new(stdout().lock(), is_tmux);
-	let res = run_action(Action::Query(&k_img), &mut writer, ev_stream).await;
+	let res = run_action(Action::Query(&k_img), ev_stream).await;
 
 	disable_raw_mode().unwrap();
 
@@ -179,12 +139,9 @@ impl Display for DisplayErrSource<'_> {
 
 pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
-	is_tmux: bool,
 	ev_stream: &'es mut EventStream,
 	last_z_index: &mut i32
 ) -> Result<(), DisplayErr<'es>> {
-	let mut writer = MaybeTmuxWriter::new(stdout().lock(), is_tmux);
-
 	let images = match display {
 		KittyDisplay::NoChange => return Ok(()),
 		KittyDisplay::ClearImages =>
@@ -193,7 +150,6 @@ pub async fn display_kitty_images<'es>(
 					effect: ClearOrDelete::Clear,
 					which: WhichToDelete::All
 				}),
-				&mut writer,
 				ev_stream
 			)
 			.await
@@ -220,7 +176,7 @@ pub async fn display_kitty_images<'es>(
 			..DisplayConfig::default()
 		};
 
-		execute!(&mut writer, MoveTo(pos.x, pos.y)).unwrap();
+		execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
 
 		log::debug!("going to display img {img:#?}");
 		log::debug!("displaying with config {config:#?}");
@@ -249,7 +205,6 @@ pub async fn display_kitty_images<'es>(
 						config,
 						placement_id: None
 					},
-					&mut writer,
 					ev_stream
 				)
 				.await
@@ -266,7 +221,6 @@ pub async fn display_kitty_images<'es>(
 					placement_id: *image_id,
 					config
 				},
-				&mut writer,
 				ev_stream
 			)
 			.await
@@ -299,7 +253,6 @@ pub async fn display_kitty_images<'es>(
 				effect: ClearOrDelete::Clear,
 				which: WhichToDelete::PlacementsWithZIndex(z_idxes_to_remove)
 			}),
-			&mut writer,
 			ev_stream
 		)
 		.await

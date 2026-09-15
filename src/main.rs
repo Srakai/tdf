@@ -1,4 +1,7 @@
-use core::{error::Error, num::NonZeroUsize};
+use core::{
+	error::Error,
+	num::{NonZeroU32, NonZeroUsize}
+};
 use std::{
 	borrow::Cow,
 	ffi::OsString,
@@ -36,8 +39,7 @@ use tdf::{
 	PrerenderLimit,
 	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
 	kitty::{
-		DisplayErr, DisplayErrSource, KittyDisplay, MaybeTmuxWriter, display_kitty_images,
-		do_shms_work, run_action
+		DisplayErr, DisplayErrSource, KittyDisplay, display_kitty_images, do_shms_work, run_action
 	},
 	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
 	tui::{BottomMessage, InputAction, MessageSetting, Tui}
@@ -311,18 +313,25 @@ async fn inner_main() -> Result<(), WrappedErr> {
 
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
 	let is_tmux = std::env::var_os("TMUX").is_some();
+	// ratatui-image chunks Kitty payloads for tmux and uses pane-relative placeholders.
+	let use_kittage = is_kitty && !is_tmux;
 
-	let shms_work = is_kitty && do_shms_work(is_tmux, &mut ev_stream).await;
+	let shms_work = use_kittage && do_shms_work(&mut ev_stream).await;
 
 	tokio::spawn(run_conversion_loop(
-		to_main, from_main, picker, 20, shms_work
+		to_main,
+		from_main,
+		picker,
+		20,
+		shms_work,
+		use_kittage
 	));
 
 	let file_name = path.file_name().map_or_else(
 		|| "Unknown file".into(),
 		|n| n.to_string_lossy().to_string()
 	);
-	let tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty);
+	let tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, use_kittage);
 
 	let backend = CrosstermBackend::new(std::io::stdout());
 	let mut term = Terminal::new(backend).map_err(|e| {
@@ -336,14 +345,12 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		)
 	})?;
 
-	if is_kitty {
-		let mut writer = MaybeTmuxWriter::new(stdout().lock(), is_tmux);
+	if use_kittage {
 		run_action(
 			Action::Delete(DeleteConfig {
 				effect: ClearOrDelete::Delete,
-				which: WhichToDelete::All
+				which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
 			}),
-			&mut writer,
 			&mut ev_stream
 		)
 		.await
@@ -365,14 +372,14 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let tui_rx = tui_rx.into_stream();
 	let from_converter = from_converter.into_stream();
 
-	let res = enter_redraw_loop(
-		&mut ev_stream,
+	enter_redraw_loop(
+		ev_stream,
 		to_renderer,
 		tui_rx,
 		to_converter,
 		from_converter,
 		fullscreen,
-		is_tmux,
+		use_kittage,
 		tui,
 		&mut term,
 		main_area,
@@ -386,35 +393,21 @@ async fn inner_main() -> Result<(), WrappedErr> {
 			)
 			.into()
 		)
-	});
-
-	if is_kitty {
-		let mut writer = MaybeTmuxWriter::new(stdout().lock(), is_tmux);
-		_ = run_action(
-			Action::Delete(DeleteConfig {
-				effect: ClearOrDelete::Delete,
-				which: WhichToDelete::All
-			}),
-			&mut writer,
-			&mut ev_stream
-		)
-		.await;
-	}
+	})?;
 	drop(maybe_logger);
-
-	res
+	Ok(())
 }
 
 // oh shut up clippy who cares
 #[expect(clippy::too_many_arguments)]
 async fn enter_redraw_loop(
-	ev_stream: &mut EventStream,
+	mut ev_stream: EventStream,
 	to_renderer: Sender<RenderNotif>,
 	mut tui_rx: RecvStream<'_, Result<RenderInfo, RenderError>>,
 	to_converter: Sender<ConverterMsg>,
 	mut from_converter: RecvStream<'_, Result<ConvertedPage, RenderError>>,
 	mut fullscreen: bool,
-	is_tmux: bool,
+	use_kittage: bool,
 	mut tui: Tui,
 	term: &mut Terminal<CrosstermBackend<Stdout>>,
 	mut main_area: tdf::tui::RenderLayout,
@@ -494,35 +487,37 @@ async fn enter_redraw_loop(
 				to_display = tui.render(f, &main_area, font_size);
 			})?;
 
-			let maybe_err =
-				display_kitty_images(to_display, is_tmux, ev_stream, &mut kitty_z_idx).await;
+			if use_kittage {
+				let maybe_err =
+					display_kitty_images(to_display, &mut ev_stream, &mut kitty_z_idx).await;
 
-			if let Err(DisplayErr {
-				failed_pages,
-				user_facing_err,
-				source
-			}) = maybe_err
-			{
-				match source {
-					// This is the error that kitty & ghostty provide us when they delete an
-					// image due to memory constraints, so if we get it, we just fix it by
-					// re-rendering so it don't display it to the user
-					//
-					// [TODO] maybe when we detect that an image was deleted, we probe the
-					// terminal for the pages around it to see if they were deleted too and if
-					// they were, we re-render them? idk
-					DisplayErrSource::Transmission(TransmitError::Terminal(
-						TerminalError::NoEntity(_)
-					)) => (),
-					_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
-						"{user_facing_err}: {source}"
-					))))
-				}
+				if let Err(DisplayErr {
+					failed_pages,
+					user_facing_err,
+					source
+				}) = maybe_err
+				{
+					match source {
+						// This is the error that kitty & ghostty provide us when they delete an
+						// image due to memory constraints, so if we get it, we just fix it by
+						// re-rendering so it don't display it to the user
+						//
+						// [TODO] maybe when we detect that an image was deleted, we probe the
+						// terminal for the pages around it to see if they were deleted too and if
+						// they were, we re-render them? idk
+						DisplayErrSource::Transmission(TransmitError::Terminal(
+							TerminalError::NoEntity(_)
+						)) => (),
+						_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+							"{user_facing_err}: {source}"
+						))))
+					}
 
-				for page_num in failed_pages {
-					tui.page_failed_display(page_num);
-					// So that they get re-rendered and sent over again
-					to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+					for page_num in failed_pages {
+						tui.page_failed_display(page_num);
+						// So that they get re-rendered and sent over again
+						to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+					}
 				}
 			}
 
