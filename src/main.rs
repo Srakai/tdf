@@ -312,11 +312,11 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let (to_main, from_converter) = flume::unbounded();
 
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
-	let is_tmux = std::env::var_os("TMUX").is_some();
-	// ratatui-image chunks Kitty payloads for tmux and uses pane-relative placeholders.
-	let use_kittage = is_kitty && !is_tmux;
+	let is_tmux = std::env::var("TERM").is_ok_and(|term| term.starts_with("tmux"))
+		|| std::env::var("TERM_PROGRAM").is_ok_and(|term| term == "tmux");
+	let use_kittage = is_kitty;
 
-	let shms_work = use_kittage && do_shms_work(&mut ev_stream).await;
+	let shms_work = use_kittage && !is_tmux && do_shms_work(&mut ev_stream).await;
 
 	tokio::spawn(run_conversion_loop(
 		to_main,
@@ -351,7 +351,8 @@ async fn inner_main() -> Result<(), WrappedErr> {
 				effect: ClearOrDelete::Delete,
 				which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
 			}),
-			&mut ev_stream
+			&mut ev_stream,
+			is_tmux
 		)
 		.await
 		.map_err(|e| {
@@ -380,6 +381,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		from_converter,
 		fullscreen,
 		use_kittage,
+		is_tmux,
 		tui,
 		&mut term,
 		main_area,
@@ -394,6 +396,21 @@ async fn inner_main() -> Result<(), WrappedErr> {
 			.into()
 		)
 	})?;
+
+	if use_kittage {
+		let mut cleanup_ev_stream = EventStream::new();
+		run_action(
+			Action::Delete(DeleteConfig {
+				effect: ClearOrDelete::Delete,
+				which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
+			}),
+			&mut cleanup_ev_stream,
+			is_tmux
+		)
+		.await
+		.map_err(|e| WrappedErr(format!("Couldn't clean up displayed images: {e}").into()))?;
+	}
+
 	drop(maybe_logger);
 	Ok(())
 }
@@ -408,6 +425,7 @@ async fn enter_redraw_loop(
 	mut from_converter: RecvStream<'_, Result<ConvertedPage, RenderError>>,
 	mut fullscreen: bool,
 	use_kittage: bool,
+	is_tmux: bool,
 	mut tui: Tui,
 	term: &mut Terminal<CrosstermBackend<Stdout>>,
 	mut main_area: tdf::tui::RenderLayout,
@@ -489,7 +507,8 @@ async fn enter_redraw_loop(
 
 			if use_kittage {
 				let maybe_err =
-					display_kitty_images(to_display, &mut ev_stream, &mut kitty_z_idx).await;
+					display_kitty_images(to_display, &mut ev_stream, &mut kitty_z_idx, is_tmux)
+						.await;
 
 				if let Err(DisplayErr {
 					failed_pages,

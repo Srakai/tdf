@@ -1,5 +1,8 @@
 use core::fmt::Display;
-use std::{io::Write, num::NonZeroU32};
+use std::{
+	io::{Error as IoError, ErrorKind, Write},
+	num::NonZeroU32
+};
 
 use crossterm::{
 	cursor::MoveTo,
@@ -9,7 +12,7 @@ use crossterm::{
 };
 use image::DynamicImage;
 use kittage::{
-	AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat,
+	AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat, Verbosity,
 	action::Action,
 	delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
 	display::{CursorMovementPolicy, DisplayConfig, DisplayLocation},
@@ -41,6 +44,64 @@ pub struct DbgWriter<W: Write> {
 	buf: String
 }
 
+struct TmuxChunkWriter<W: Write> {
+	inner: W,
+	buf: Vec<u8>
+}
+
+impl<W: Write> TmuxChunkWriter<W> {
+	fn new(inner: W) -> Self {
+		Self {
+			inner,
+			buf: Vec::new()
+		}
+	}
+
+	fn write_wrapped(&mut self, sequence: &[u8]) -> std::io::Result<()> {
+		self.inner.write_all(b"\x1bPtmux;")?;
+
+		let mut last_written = 0;
+		for (idx, byte) in sequence.iter().enumerate() {
+			if *byte == b'\x1b' {
+				self.inner.write_all(&sequence[last_written..=idx])?;
+				self.inner.write_all(b"\x1b")?;
+				last_written = idx + 1;
+			}
+		}
+		self.inner.write_all(&sequence[last_written..])?;
+		self.inner.write_all(b"\x1b\\")
+	}
+}
+
+impl<W: Write> Write for TmuxChunkWriter<W> {
+	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+		self.buf.extend_from_slice(buf);
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		let buf = std::mem::take(&mut self.buf);
+		let mut sequence_start = 0;
+
+		while sequence_start < buf.len() {
+			let Some(terminator) = buf[sequence_start..]
+				.windows(2)
+				.position(|window| window == b"\x1b\\")
+			else {
+				return Err(IoError::new(
+					ErrorKind::InvalidData,
+					"Kitty command did not end with ST"
+				));
+			};
+			let sequence_end = sequence_start + terminator + 2;
+			self.write_wrapped(&buf[sequence_start..sequence_end])?;
+			sequence_start = sequence_end;
+		}
+
+		self.inner.flush()
+	}
+}
+
 impl<W: Write> Write for DbgWriter<W> {
 	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
 		#[cfg(debug_assertions)]
@@ -64,8 +125,36 @@ impl<W: Write> Write for DbgWriter<W> {
 
 pub async fn run_action<'es>(
 	action: Action<'_, '_>,
-	ev_stream: &'es mut EventStream
+	ev_stream: &'es mut EventStream,
+	is_tmux: bool
 ) -> Result<Option<ImageId>, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
+	if is_tmux {
+		let image_id = match &action {
+			Action::Transmit(image) => match image.num_or_id {
+				NumberOrId::Id(id) => Some(id),
+				NumberOrId::Number(_) => None
+			},
+			Action::Query(image) => match image.num_or_id {
+				NumberOrId::Id(id) => Some(id),
+				NumberOrId::Number(_) => None
+			},
+			Action::TransmitAndDisplay { image, .. } => match image.num_or_id {
+				NumberOrId::Id(id) => Some(id),
+				NumberOrId::Number(_) => None
+			},
+			Action::Display { image_id, .. } => Some(*image_id),
+			Action::Delete(_) => None
+		};
+
+		action
+			.write_transmit_to(
+				TmuxChunkWriter::new(std::io::stdout().lock()),
+				Verbosity::Silent
+			)
+			.map_err(TransmitError::Writing)?;
+		return Ok(image_id);
+	}
+
 	let writer = DbgWriter {
 		w: std::io::stdout().lock(),
 		#[cfg(debug_assertions)]
@@ -94,7 +183,7 @@ pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
 
 	enable_raw_mode().unwrap();
 
-	let res = run_action(Action::Query(&k_img), ev_stream).await;
+	let res = run_action(Action::Query(&k_img), ev_stream, false).await;
 
 	disable_raw_mode().unwrap();
 
@@ -140,7 +229,8 @@ impl Display for DisplayErrSource<'_> {
 pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
 	ev_stream: &'es mut EventStream,
-	last_z_index: &mut i32
+	last_z_index: &mut i32,
+	is_tmux: bool
 ) -> Result<(), DisplayErr<'es>> {
 	let images = match display {
 		KittyDisplay::NoChange => return Ok(()),
@@ -150,7 +240,8 @@ pub async fn display_kitty_images<'es>(
 					effect: ClearOrDelete::Clear,
 					which: WhichToDelete::All
 				}),
-				ev_stream
+				ev_stream,
+				is_tmux
 			)
 			.await
 			.map_err(|e| DisplayErr::empty("Couldn't clear previous images", e))
@@ -183,6 +274,10 @@ pub async fn display_kitty_images<'es>(
 
 		let this_err = match img {
 			MaybeTransferred::NotYet(image) => {
+				let placement_id = match (is_tmux, image.num_or_id) {
+					(true, NumberOrId::Id(id)) => Some(id),
+					_ => None
+				};
 				let mut fake_image = Image {
 					num_or_id: image.num_or_id,
 					format: PixelFormat::Rgb24(
@@ -203,9 +298,10 @@ pub async fn display_kitty_images<'es>(
 					Action::TransmitAndDisplay {
 						image: fake_image,
 						config,
-						placement_id: None
+						placement_id
 					},
-					ev_stream
+					ev_stream,
+					is_tmux
 				)
 				.await
 				.map_err(DisplayErrSource::Transmission)
@@ -221,7 +317,8 @@ pub async fn display_kitty_images<'es>(
 					placement_id: *image_id,
 					config
 				},
-				ev_stream
+				ev_stream,
+				is_tmux
 			)
 			.await
 			// don't need the return id 'cause we already know it
@@ -253,10 +350,30 @@ pub async fn display_kitty_images<'es>(
 				effect: ClearOrDelete::Clear,
 				which: WhichToDelete::PlacementsWithZIndex(z_idxes_to_remove)
 			}),
-			ev_stream
+			ev_stream,
+			is_tmux
 		)
 		.await
 		.map_err(|e| DisplayErr::empty("Couldn't clear previously-sent images", e))
 		.map(|_| ())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn wraps_each_kitty_chunk_separately_for_tmux() {
+		let mut writer = TmuxChunkWriter::new(Vec::new());
+		writer
+			.write_all(b"\x1b_Gm=1;first\x1b\\\x1b_Gm=0;second\x1b\\")
+			.unwrap();
+		writer.flush().unwrap();
+
+		assert_eq!(
+			writer.inner,
+			b"\x1bPtmux;\x1b\x1b_Gm=1;first\x1b\x1b\\\x1b\\\x1bPtmux;\x1b\x1b_Gm=0;second\x1b\x1b\\\x1b\\"
+		);
 	}
 }
